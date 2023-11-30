@@ -1,19 +1,9 @@
+/* SPDX-License-Identifier: ISC */
+
 /*
  * clockperf
  *
- * Copyright (c) 2016-2021, Steven Noonan <steven@uplinklabs.net>
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) 2016-2023, Steven Noonan <steven@uplinklabs.net>
  *
  */
 
@@ -143,6 +133,9 @@
 #    define TARGET_COMPILER_CYGWIN
 #    define TARGET_OS_WINDOWS
 #    define OS_DETECTED
+#  endif
+#  if defined(__clang__)
+#    define TARGET_COMPILER_CLANG
 #  endif
 #  if defined (__MINGW32__)
 #    define TARGET_COMPILER_MINGW

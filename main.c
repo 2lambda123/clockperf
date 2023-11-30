@@ -1,19 +1,9 @@
+/* SPDX-License-Identifier: ISC */
+
 /*
  * clockperf
  *
- * Copyright (c) 2016-2021, Steven Noonan <steven@uplinklabs.net>
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) 2016-2023, Steven Noonan <steven@uplinklabs.net>
  *
  */
 
@@ -21,7 +11,9 @@
 #include "affinity.h"
 #include "clock.h"
 #include "drift.h"
+#include "tscemu.h"
 #include "util.h"
+#include "winapi.h"
 #include "version.h"
 
 #ifdef _MSC_VER
@@ -75,35 +67,37 @@ static struct clockspec clock_sources[] = {
 #ifdef CLOCK_UPTIME_RAW_APPROX // OS X
     {CPERF_GETTIME, CLOCK_UPTIME_RAW_APPROX},
 #endif
+#ifdef ALLOW_RUSAGE_CLOCKS
 #ifdef CLOCK_PROCESS_CPUTIME_ID
     {CPERF_GETTIME, CLOCK_PROCESS_CPUTIME_ID},
 #endif
 #ifdef CLOCK_THREAD_CPUTIME_ID
     {CPERF_GETTIME, CLOCK_THREAD_CPUTIME_ID},
 #endif
-#endif
+#endif // ALLOW_RUSAGE_CLOCKS
+#endif // HAVE_CLOCK_GETTIME
+#ifdef ALLOW_RUSAGE_CLOCKS
 #ifdef HAVE_CLOCK
     {CPERF_CLOCK, 0},
 #endif
 #ifdef HAVE_GETRUSAGE
     {CPERF_RUSAGE, 0},
 #endif
-#ifdef HAVE_FTIME
-    {CPERF_FTIME, 0},
-#endif
+#endif // ALLOW_RUSAGE_CLOCKS
+#ifdef ALLOW_LOWRES_CLOCKS
 #ifdef HAVE_TIME
     {CPERF_TIME, 0},
 #endif
+#endif // ALLOW_LOWRES_CLOCKS
 #ifdef TARGET_OS_WINDOWS
     {CPERF_QUERYPERFCOUNTER, 0},
     {CPERF_GETTICKCOUNT, 0},
     {CPERF_GETTICKCOUNT64, 0},
     {CPERF_TIMEGETTIME, 0},
     {CPERF_GETSYSTIME, 0},
-#if _WIN32_WINNT >= 0x0602
     {CPERF_GETSYSTIMEPRECISE, 0},
-#endif
     {CPERF_UNBIASEDINTTIME, 0},
+    {CPERF_UNBIASEDINTTIMEPRECISE, 0},
 #endif
     {CPERF_NULL, 0},
 };
@@ -451,95 +445,6 @@ cleanup:
     free(cost_other);
 }
 
-#if 0
-#if defined(TARGET_CPU_X86_64) || defined(TARGET_CPU_X86)
-static int cpuid(uint32_t *_regs)
-{
-#ifdef TARGET_COMPILER_MSVC
-    __cpuidex(_regs, _regs[0], _regs[2]);
-#else
-#ifdef TARGET_CPU_X86
-    static int cpuid_support = 0;
-    if (!cpuid_support) {
-        uint32_t pre_change, post_change;
-        const uint32_t id_flag = 0x200000;
-        asm ("pushfl\n\t"      /* Save %eflags to restore later.  */
-             "pushfl\n\t"      /* Push second copy, for manipulation.  */
-             "popl %1\n\t"     /* Pop it into post_change.  */
-             "movl %1,%0\n\t"  /* Save copy in pre_change.   */
-             "xorl %2,%1\n\t"  /* Tweak bit in post_change.  */
-             "pushl %1\n\t"    /* Push tweaked copy... */
-             "popfl\n\t"       /* ... and pop it into %eflags.  */
-             "pushfl\n\t"      /* Did it change?  Push new %eflags... */
-             "popl %1\n\t"     /* ... and pop it into post_change.  */
-             "popfl"           /* Restore original value.  */
-             : "=&r" (pre_change), "=&r" (post_change)
-             : "ir" (id_flag));
-        if (((pre_change ^ post_change) & id_flag) == 0)
-            return 1;
-        cpuid_support = 1;
-    }
-#endif
-    asm volatile(
-        "cpuid"
-        : "=a" (_regs[0]),
-          "=b" (_regs[1]),
-          "=c" (_regs[2]),
-          "=d" (_regs[3])
-        : "0" (_regs[0]), "2" (_regs[2]));
-#endif
-    return 0;
-}
-#endif
-
-/*
- * int have_invariant_tsc(void)
- *
- * returns nonzero if CPU has invariant TSC
- */
-static int have_invariant_tsc(void)
-{
-    static int ret = -1;
-
-    if (ret != -1)
-        return ret;
-
-    ret = 0;
-
-#if defined(TARGET_CPU_X86) || defined(TARGET_CPU_X86_64)
-    {
-    uint32_t regs[4];
-    char vendor[13];
-
-    memset(regs, 0, sizeof(regs));
-    if (cpuid(regs)) {
-        /* CPUID couldn't be queried */
-        return ret;
-    }
-    vendor[12] = 0;
-    *(uint32_t *)(&vendor[0]) = regs[1];
-    *(uint32_t *)(&vendor[4]) = regs[3];
-    *(uint32_t *)(&vendor[8]) = regs[2];
-
-    if (!strcmp(vendor, "GenuineIntel") ||
-        !strcmp(vendor, "AuthenticAMD")) {
-        memset(regs, 0, sizeof(regs));
-        regs[0] = 0x80000000;
-        cpuid(regs);
-        if (regs[0] >= 0x80000007) {
-            memset(regs, 0, sizeof(regs));
-            regs[0] = 0x80000007;
-            cpuid(regs);
-            ret = (regs[3] & 0x100) ? 1 : 0;
-        }
-    }
-    }
-#endif
-
-    return ret;
-}
-#endif
-
 static void version(void)
 {
     printf("clockperf v%s\n\n", clockperf_version_long());
@@ -573,6 +478,7 @@ static void usage(const char *argv0)
 static int do_drift;
 static int do_monitor;
 static int do_list;
+int do_emulate_tsc;
 static int ref_index;
 
 int main(int argc, char **argv)
@@ -590,11 +496,12 @@ int main(int argc, char **argv)
             {"monitor", optional_argument, 0, 'm'},
             {"ref", optional_argument, 0, 'r'},
             {"list", optional_argument, 0, 'l'},
+            {"emulate-tsc", no_argument, 0, 'e'},
             {0, 0, 0, 0}
         };
         int c, option_index = 0;
 
-        c = getopt_long(argc, argv, "vhd:l", long_options, &option_index);
+        c = getopt_long(argc, argv, "vhr:m:d:le", long_options, &option_index);
         if (c == -1)
             break;
         switch (c) {
@@ -634,6 +541,9 @@ int main(int argc, char **argv)
                     ref_index = v;
             }
             break;
+        case 'e':
+            do_emulate_tsc = 1;
+            break;
         case 'l':
             do_list = 1;
             break;
@@ -649,6 +559,10 @@ int main(int argc, char **argv)
         }
     }
 
+    if (do_emulate_tsc)
+        tscemu_init();
+
+    winapi_init();
     timers_init();
     thread_init();
     cpu_clock_init();
@@ -656,10 +570,6 @@ int main(int argc, char **argv)
 #ifdef HAVE_DRIFT_TESTS
     if (do_drift)
         drift_init();
-#endif
-
-#if 0
-    printf("Invariant TSC: %s\n\n", have_invariant_tsc() ? "Yes" : "No");
 #endif
 
     if (do_list) {
@@ -693,6 +603,9 @@ int main(int argc, char **argv)
 
         printf("Name                Cost(ns)      +/-    Resol  Mono  Fail  Warp  Stal  Regr\n");
         for (p = clock_sources; p->major != CPERF_NULL; p++) {
+            uint64_t read;
+            if (clock_read(*p, &read) != 0)
+                continue;
             clock_choose_ref(*p);
             clock_compare(*p, ref_clock);
         }
@@ -763,6 +676,10 @@ int main(int argc, char **argv)
     }
 
     timers_destroy();
+
+    if (do_emulate_tsc)
+        tscemu_destroy();
+
     return 0;
 }
 

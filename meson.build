@@ -1,7 +1,7 @@
 project('clockperf', 'c',
     default_options: [
         'buildtype=release',
-        'c_std=c99',
+        'c_std=gnu11',
     ]
 )
 
@@ -18,7 +18,7 @@ gen_license_h = custom_target('license.h',
                               output : ['license.h'],
                               command : [meson.current_source_dir() + '/tools/license.pl', '@INPUT@', '@OUTPUT@'])
 
-src = ['affinity.c', 'clock.c', 'drift.c', 'main.c', 'util.c', 'version.c']
+src = ['affinity.c', 'clock.c', 'drift.c', 'main.c', 'tscemu.c', 'util.c', 'winapi.c', 'version.c']
 
 system_deps = []
 incdir_paths = ['.']

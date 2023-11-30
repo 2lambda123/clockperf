@@ -1,27 +1,26 @@
+/* SPDX-License-Identifier: ISC */
+
 /*
  * clockperf
  *
- * Copyright (c) 2016-2021, Steven Noonan <steven@uplinklabs.net>
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) 2016-2023, Steven Noonan <steven@uplinklabs.net>
  *
  */
 
 #include "prefix.h"
 #include "clock.h"
+#include "tscemu.h"
+#include "util.h"
+#include "winapi.h"
 
 #include <assert.h>
 #include <limits.h>
+
+#ifdef TARGET_OS_LINUX
+#include <sched.h>
+#endif
+
+extern int do_emulate_tsc;
 
 struct clockspec tsc_ref_clock = { CPERF_NONE, 0 };
 struct clockspec ref_clock = { CPERF_NONE, 0 };
@@ -30,23 +29,14 @@ struct clockspec ref_clock = { CPERF_NONE, 0 };
  * Choices for ref_clock in order of preference, from best to worst.
  */
 static struct clockspec ref_clock_choices[] = {
-#ifdef HAVE_CPU_CLOCK
-/* Not safe to use TSC as a reference clock, unless we can empirically verify
- * it's trustworthy. e.g. are TSCs on all cores synced?
- *
- * TODO: Add a CPU clock sanity test.
- */
-#if 0
-    {CPERF_TSC, 0},
-#endif
-#endif
 #ifdef TARGET_OS_WINDOWS
-#if _WIN32_WINNT >= 0x0602
     {CPERF_GETSYSTIMEPRECISE, 0},
-#endif
     {CPERF_QUERYPERFCOUNTER, 0},
 #endif
 #ifdef HAVE_CLOCK_GETTIME
+#ifdef CLOCK_MONOTONIC_RAW
+    {CPERF_GETTIME, CLOCK_MONOTONIC_RAW},
+#endif
 #ifdef CLOCK_MONOTONIC
     {CPERF_GETTIME, CLOCK_MONOTONIC},
 #endif
@@ -136,54 +126,26 @@ fail:
     return 1;
 }
 
-#if defined(TARGET_CPU_X86)
-static const char *cpu_clock_name(void)
-{
-    return "tsc";
-}
+static uint32_t cpu_clock_known_freq;
 
-void cpu_clock_init(void)
-{
-}
+#if defined(TARGET_CPU_X86) || defined(TARGET_CPU_X86_64)
+#ifdef TARGET_COMPILER_MSVC
+#include <intrin.h>
+#else
+#include <x86intrin.h>
+#endif
 
 static INLINE uint64_t cpu_clock_read(void)
 {
-    uint32_t lo, hi;
-
-#ifdef TARGET_COMPILER_MSVC
-    __asm {
-        rdtsc
-        mov lo, eax
-        mov hi, edx
-    }
-#else
-    __asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
-#endif
-    return ((uint64_t) hi << 32ULL) | lo;
+    uint32_t aux;
+    uint64_t rv;
+    if (do_emulate_tsc)
+        tscemu_enable();
+    rv = __rdtscp(&aux);
+    if (do_emulate_tsc)
+        tscemu_disable();
+    return rv;
 }
-#elif defined(TARGET_CPU_X86_64)
-static const char *cpu_clock_name(void)
-{
-    return "tsc";
-}
-
-void cpu_clock_init(void)
-{
-}
-
-static INLINE uint64_t cpu_clock_read(void)
-{
-#ifdef TARGET_COMPILER_MSVC
-    return __rdtsc();
-#else
-    uint32_t lo, hi;
-
-    __asm__ __volatile__("rdtsc" : "=a" (lo), "=d" (hi));
-    return ((uint64_t) hi << 32ULL) | lo;
-#endif
-}
-
-
 #elif defined(TARGET_CPU_ARM) && TARGET_CPU_BITS == 64
 
 #ifdef _MSC_VER
@@ -197,10 +159,6 @@ static INLINE uint64_t cpu_clock_read(void)
 #endif
 #endif
 
-#ifdef HAVE_KNOWN_TSC_FREQUENCY
-static uint64_t cntfrq_el0;
-#endif
-
 static const char *cpu_clock_name(void)
 {
     return "cntvct";
@@ -208,7 +166,7 @@ static const char *cpu_clock_name(void)
 
 void cpu_clock_init(void)
 {
-#ifdef HAVE_KNOWN_TSC_FREQUENCY
+    uint64_t cntfrq_el0;
 #ifdef _MSC_VER
     cntfrq_el0 = _ReadStatusReg(ARM64_CNTFRQ);
 #else
@@ -217,8 +175,8 @@ void cpu_clock_init(void)
                  : "=r"(cval));
     cntfrq_el0 = cval;
 #endif
-    assert(cntfrq_el0 != 0);
-#endif
+    if (cntfrq_el0)
+        cpu_clock_known_freq = cntfrq_el0 / 1000;
 }
 
 static INLINE uint64_t cpu_clock_read()
@@ -309,6 +267,110 @@ void cpu_clock_init(void)
 }
 #endif
 
+#if defined(TARGET_OS_WINDOWS)
+static INLINE int64_t clock_scale_generic(int64_t _freq, int64_t _ctr, int64_t _period_den)
+{
+	// Instead of just having "(_ctr * _period_den) / _freq",
+	// the algorithm below prevents overflow when _ctr is sufficiently large.
+	// It assumes that _freq * _period_den does not overflow, which is currently true for nano period.
+	// It is not realistic for _ctr to accumulate to large values from zero with this assumption,
+	// but the initial value of _ctr could be large.
+
+	const int64_t whole = (_ctr / _freq) * _period_den;
+	const int64_t part = (_ctr % _freq) * _period_den / _freq;
+	return whole + part;
+}
+
+// Specialization: if the frequency value is 10MHz (common for
+// QueryPerformanceFrequency on x86/x64), we use this function instead, because
+// the compiler will change the frequency divisions into shifts and multiplies.
+static INLINE int64_t clock_scale_10MHz(int64_t _ctr, int64_t _period_den)
+{
+	const int64_t _freq = 10000000LL;
+	return clock_scale_generic(_freq, _ctr, _period_den);
+}
+
+// Specialization: if the frequency value is 24MHz (common for
+// QueryPerformanceFrequency on ARM64), we use this function instead, because
+// the compiler will change the frequency divisions into shifts and multiplies.
+static INLINE int64_t clock_scale_24MHz(int64_t _ctr, int64_t _period_den)
+{
+	const int64_t _freq = 24000000LL;
+	return clock_scale_generic(_freq, _ctr, _period_den);
+}
+
+static int64_t clock_scale_dispatch(int64_t _freq, int64_t _ctr, int64_t _period_den)
+{
+	switch (_freq) {
+	case 10000000LL: return clock_scale_10MHz(_ctr, _period_den); break;
+	case 24000000LL: return clock_scale_24MHz(_ctr, _period_den); break;
+	}
+	return clock_scale_generic(_freq, _ctr, _period_den);
+}
+#endif
+
+
+/* Common for x86 32/64-bit */
+#if defined(TARGET_CPU_X86) || defined(TARGET_CPU_X86_64)
+static const char *cpu_clock_name(void)
+{
+    return "tsc";
+}
+
+void cpu_clock_init(void)
+{
+    uint32_t max_leaf;
+    uint32_t regs[4];
+
+    /* Check maximum supported base leaf */
+    memset(regs, 0, sizeof(regs));
+    cpuid_read(regs);
+    max_leaf = regs[0];
+
+    if (max_leaf >= 0x15) {
+        uint32_t numer, denom, crystal_khz;
+
+        /* Read TSC information leaf */
+        memset(regs, 0, sizeof(regs));
+        regs[0] = 0x15;
+        cpuid_read(regs);
+
+        denom = regs[0];
+        numer = regs[1];
+        crystal_khz = regs[2];
+
+        if (denom && numer) {
+            if (!crystal_khz && max_leaf >= 0x16) {
+                /* Skylake and Kaby Lake don't set a valid ecx value in leaf
+                 * 0x15, but we can infer it from leaf 0x16 and the ratio in
+                 * leaf 0x15
+                 */
+                memset(regs, 0, sizeof(regs));
+                regs[0] = 0x16;
+                cpuid_read(regs);
+
+                crystal_khz = regs[0] * 1000 * denom / numer;
+            }
+
+            if (crystal_khz) {
+                cpu_clock_known_freq = crystal_khz * numer / denom;
+            }
+        }
+    }
+
+#ifdef TARGET_OS_LINUX
+    if (!cpu_clock_known_freq) {
+        FILE *fd = fopen("/sys/devices/system/cpu/tsc_khz", "rt");
+        if (fd) {
+            if (fscanf(fd, "%u", &cpu_clock_known_freq) != 1)
+                cpu_clock_known_freq = 0;
+            fclose(fd);
+        }
+    }
+#endif
+}
+#endif
+
 #ifdef HAVE_CPU_CLOCK
 
 static unsigned long long cycles_per_msec;
@@ -323,12 +385,15 @@ static unsigned int max_cycles_shift;
 
 static unsigned long get_cycles_per_msec(void)
 {
-#if defined(HAVE_KNOWN_TSC_FREQUENCY) && defined(TARGET_CPU_ARM) && TARGET_CPU_BITS == 64
-    return cntfrq_el0 / 1000;
-#else
     uint64_t wc_s, wc_e;
     uint64_t c_s, c_e;
     uint64_t elapsed;
+
+    /* Early out if we have an already-known CPU frequency and we don't need to
+     * infer it.
+     */
+    if (cpu_clock_known_freq)
+        return cpu_clock_known_freq;
 
     if (clock_read(tsc_ref_clock, &wc_s)) {
         fprintf(stderr, "Reference clock '%s' died while measuring TSC frequency\n",
@@ -350,7 +415,6 @@ static unsigned long get_cycles_per_msec(void)
     } while (1);
 
     return (c_e - c_s) * 1000000 / elapsed;
-#endif
 }
 
 #ifndef min
@@ -381,6 +445,11 @@ void cpu_clock_calibrate(void)
     uint64_t minc, maxc, avg, cycles[NR_TIME_ITERS];
     int i, samples, sft = 0;
     unsigned long long tmp, max_ticks, max_mult;
+
+#ifdef TARGET_OS_LINUX
+    /* Allow the kernel to reschedule us so we get a full time slice */
+    sched_yield();
+#endif
 
     cpu_clock_init_ref();
 
@@ -528,16 +597,6 @@ int clock_read(struct clockspec spec, uint64_t *output)
             }
             break;
 #endif
-#ifdef HAVE_FTIME
-        case CPERF_FTIME:
-            {
-                struct timeb time;
-                if (ftime(&time))
-                    return 1;
-                *output = (time.time * 1000000000ULL) + (time.millitm * 1000000ULL);
-            }
-            break;
-#endif
 #ifdef HAVE_TIME
         case CPERF_TIME:
             {
@@ -565,7 +624,7 @@ int clock_read(struct clockspec spec, uint64_t *output)
                 }
                 if (!QueryPerformanceCounter(&qpc))
                     return 1;
-                *output = qpc.QuadPart * 1000000000ULL / qpc_freq.QuadPart;
+                *output = clock_scale_dispatch(qpc_freq.QuadPart, qpc.QuadPart, 1000000000LL);
             }
             break;
         case CPERF_GETTICKCOUNT:
@@ -584,20 +643,29 @@ int clock_read(struct clockspec spec, uint64_t *output)
                 *output = ((uint64_t)ft.dwLowDateTime | ((uint64_t)ft.dwHighDateTime << 32)) * 100ULL;
             }
             break;
-#if _WIN32_WINNT >= 0x0602
         case CPERF_GETSYSTIMEPRECISE:
             {
                 FILETIME ft;
-                GetSystemTimePreciseAsFileTime(&ft);
+                if (!pGetSystemTimePreciseAsFileTime)
+                    return 1;
+                pGetSystemTimePreciseAsFileTime(&ft);
                 *output = ((uint64_t)ft.dwLowDateTime | ((uint64_t)ft.dwHighDateTime << 32)) * 100ULL;
             }
             break;
-#endif
         case CPERF_UNBIASEDINTTIME:
             {
                 ULONGLONG t;
-                if (!QueryUnbiasedInterruptTime(&t))
+                if (!pQueryUnbiasedInterruptTime || !pQueryUnbiasedInterruptTime(&t))
                     return 1;
+                *output = t * 100ULL;
+            }
+            break;
+        case CPERF_UNBIASEDINTTIMEPRECISE:
+            {
+                ULONGLONG t;
+                if (!pQueryUnbiasedInterruptTimePrecise)
+                    return 1;
+                pQueryUnbiasedInterruptTime(&t);
                 *output = t * 100ULL;
             }
             break;
@@ -677,10 +745,6 @@ const char *clock_name(struct clockspec spec)
     case CPERF_RUSAGE:
         return "getrusage";
 #endif
-#ifdef HAVE_FTIME
-    case CPERF_FTIME:
-        return "ftime";
-#endif
 #ifdef HAVE_TIME
     case CPERF_TIME:
         return "time";
@@ -704,6 +768,8 @@ const char *clock_name(struct clockspec spec)
         return "SysTimePrecAsFile";
     case CPERF_UNBIASEDINTTIME:
         return "UnbiasIntTime";
+    case CPERF_UNBIASEDINTTIMEPRECISE:
+        return "UnbiasIntTimePrec";
 #endif
     default:
         return "unknown";
@@ -752,7 +818,7 @@ int clock_resolution(const struct clockspec spec, uint64_t *output)
 #endif
 #ifdef HAVE_GETTIMEOFDAY
         case CPERF_GTOD:
-            return 1;
+            hz = 1000000ULL;
             break;
 #endif
 #ifdef HAVE_CPU_CLOCK
@@ -770,11 +836,6 @@ int clock_resolution(const struct clockspec spec, uint64_t *output)
              * there is no clearly defined way to determine that update
              * frequency. Best to just error out and say we can't discover it.
              */
-            return 1;
-            break;
-#endif
-#ifdef HAVE_FTIME
-        case CPERF_FTIME:
             return 1;
             break;
 #endif
@@ -807,9 +868,26 @@ int clock_resolution(const struct clockspec spec, uint64_t *output)
         case CPERF_TIMEGETTIME:
             hz = 1000ULL;
             break;
-        case CPERF_UNBIASEDINTTIME:
         case CPERF_GETSYSTIME:
+            /* NT timer ticks (100ns) */
+            hz = 10000000ULL;
+            break;
         case CPERF_GETSYSTIMEPRECISE:
+            if (!pGetSystemTimePreciseAsFileTime)
+                return 1;
+            /* NT timer ticks (100ns) */
+            hz = 10000000ULL;
+            break;
+        case CPERF_UNBIASEDINTTIME:
+            if (!pQueryUnbiasedInterruptTime)
+                return 1;
+            /* NT timer ticks (100ns) */
+            hz = 10000000ULL;
+            break;
+        case CPERF_UNBIASEDINTTIMEPRECISE:
+            if (!pQueryUnbiasedInterruptTimePrecise)
+                return 1;
+            /* NT timer ticks (100ns) */
             hz = 10000000ULL;
             break;
 #endif

@@ -1,19 +1,9 @@
+/* SPDX-License-Identifier: ISC */
+
 /*
  * clockperf
  *
- * Copyright (c) 2016-2021, Steven Noonan <steven@uplinklabs.net>
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) 2016-2023, Steven Noonan <steven@uplinklabs.net>
  *
  */
 
@@ -27,7 +17,6 @@ enum {
     CPERF_TSC,
     CPERF_CLOCK,
     CPERF_RUSAGE,
-    CPERF_FTIME,
     CPERF_TIME,
     CPERF_MACH_TIME,
     CPERF_QUERYPERFCOUNTER,
@@ -37,6 +26,7 @@ enum {
     CPERF_GETSYSTIME,
     CPERF_GETSYSTIMEPRECISE,
     CPERF_UNBIASEDINTTIME,
+    CPERF_UNBIASEDINTTIMEPRECISE,
     CPERF_NUM_CLOCKS
 };
 
@@ -63,8 +53,15 @@ void cpu_clock_calibrate(void);
     || (defined(TARGET_CPU_ARM) && TARGET_CPU_BITS == 64)
 #  define HAVE_CPU_CLOCK
 #endif
-#if defined(TARGET_CPU_ARM) && TARGET_CPU_BITS == 64
-#  define HAVE_KNOWN_TSC_FREQUENCY
+
+#if 0
+/* Allow clocks which represent CPU time used by the thread/process? */
+#define ALLOW_RUSAGE_CLOCKS
+#endif
+
+#if 0
+/* Allow clocks which have worse resolution than 1ms? */
+#define ALLOW_LOWRES_CLOCKS
 #endif
 
 /* vim: set ts=4 sts=4 sw=4 et: */

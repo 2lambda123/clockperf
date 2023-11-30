@@ -1,24 +1,21 @@
+/* SPDX-License-Identifier: ISC */
+
 /*
  * clockperf
  *
- * Copyright (c) 2016-2021, Steven Noonan <steven@uplinklabs.net>
- *
- * Permission to use, copy, modify, and/or distribute this software for any
- * purpose with or without fee is hereby granted, provided that the above
- * copyright notice and this permission notice appear in all copies.
- *
- * THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
- * WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
- * MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
- * ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
- * WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
- * ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
- * OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+ * Copyright (c) 2016-2023, Steven Noonan <steven@uplinklabs.net>
  *
  */
 
 #include "prefix.h"
 #include "util.h"
+#include "winapi.h"
+
+#ifdef TARGET_COMPILER_VC
+#if defined(TARGET_CPU_X86_64) || defined(TARGET_CPU_X86)
+#include <intrin.h>
+#endif
+#endif
 
 #ifdef TARGET_OS_WINDOWS
 #ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
@@ -26,10 +23,6 @@
 #endif
 
 static HANDLE s_timer;
-
-typedef LONG NTSTATUS;
-typedef NTSTATUS (NTAPI *NtSetTimerResolution)(ULONG DesiredResolution, BOOLEAN SetResolution, PULONG CurrentResolution);
-typedef NTSTATUS (NTAPI *NtQueryTimerResolution)(PULONG MinimumResolution, PULONG MaximumResolution, PULONG CurrentResolution);
 #endif
 
 int thread_sleep(unsigned long usec)
@@ -58,15 +51,6 @@ int thread_sleep(unsigned long usec)
 void timers_init(void)
 {
 #ifdef TARGET_OS_WINDOWS
-    NtSetTimerResolution pNtSetTimerResolution;
-    NtQueryTimerResolution pNtQueryTimerResolution;
-
-    HMODULE hNtDll = GetModuleHandleA("ntdll.dll");
-    if (!hNtDll)
-        return;
-
-    pNtSetTimerResolution = (NtSetTimerResolution)GetProcAddress(hNtDll, "NtSetTimerResolution");
-    pNtQueryTimerResolution = (NtQueryTimerResolution)GetProcAddress(hNtDll, "NtQueryTimerResolution");
     if (pNtSetTimerResolution && pNtQueryTimerResolution)
     {
         NTSTATUS result;
@@ -106,3 +90,43 @@ void timers_destroy(void)
     s_timer = NULL;
 #endif
 }
+
+#if defined(TARGET_CPU_X86_64) || defined(TARGET_CPU_X86)
+int cpuid_read(uint32_t *_regs)
+{
+#ifdef TARGET_COMPILER_MSVC
+    __cpuidex(_regs, _regs[0], _regs[2]);
+#else
+#ifdef TARGET_CPU_X86
+    static int cpuid_support = 0;
+    if (!cpuid_support) {
+        uint32_t pre_change, post_change;
+        const uint32_t id_flag = 0x200000;
+        asm ("pushfl\n\t"      /* Save %eflags to restore later.  */
+             "pushfl\n\t"      /* Push second copy, for manipulation.  */
+             "popl %1\n\t"     /* Pop it into post_change.  */
+             "movl %1,%0\n\t"  /* Save copy in pre_change.   */
+             "xorl %2,%1\n\t"  /* Tweak bit in post_change.  */
+             "pushl %1\n\t"    /* Push tweaked copy... */
+             "popfl\n\t"       /* ... and pop it into %eflags.  */
+             "pushfl\n\t"      /* Did it change?  Push new %eflags... */
+             "popl %1\n\t"     /* ... and pop it into post_change.  */
+             "popfl"           /* Restore original value.  */
+             : "=&r" (pre_change), "=&r" (post_change)
+             : "ir" (id_flag));
+        if (((pre_change ^ post_change) & id_flag) == 0)
+            return 1;
+        cpuid_support = 1;
+    }
+#endif
+    asm volatile(
+        "cpuid"
+        : "=a" (_regs[0]),
+          "=b" (_regs[1]),
+          "=c" (_regs[2]),
+          "=d" (_regs[3])
+        : "0" (_regs[0]), "2" (_regs[2]));
+#endif
+    return 0;
+}
+#endif
